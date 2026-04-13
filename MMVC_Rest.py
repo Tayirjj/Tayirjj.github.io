@@ -1,0 +1,81 @@
+import logging
+import os
+
+from webserver.restapi.mods.TrustedOrigin import TrustedOriginMiddleware
+from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi.routing import APIRoute
+from fastapi.staticfiles import StaticFiles
+from fastapi.exceptions import RequestValidationError
+from typing import Callable
+from voice_changer.VoiceChangerManager import VoiceChangerManager
+
+from webserver.restapi.MMVC_Rest_Sounds import MMVC_Rest_Sounds
+from webserver.restapi.MMVC_Rest_VoiceChanger import MMVC_Rest_VoiceChanger
+from webserver.restapi.MMVC_Rest_Models import MMVC_Rest_Models
+from webserver.restapi.MMVC_Rest_PretrainDownloader import MMVC_Rest_PretrainDownloader
+from settings import get_settings
+from const import TMP_DIR
+
+logger = logging.getLogger(__name__)
+
+class ValidationErrorLoggingRoute(APIRoute):
+    def get_route_handler(self) -> Callable:
+        original_route_handler = super().get_route_handler()
+
+        async def custom_route_handler(request: Request) -> Response:
+            try:
+                return await original_route_handler(request)
+            except RequestValidationError as e:  # type: ignore
+                logger.exception(e)
+                body = await request.body()
+                detail = {"errors": e.errors(), "body": body.decode()}
+                raise HTTPException(status_code=422, detail=detail)
+
+        return custom_route_handler
+
+class MMVC_Rest:
+    _instance = None
+
+    @classmethod
+    def get_instance(cls, voiceChangerManager: VoiceChangerManager):
+        if cls._instance is None:
+            logger.info("Initializing...")
+            settings = get_settings()
+            app_fastapi = FastAPI()
+            app_fastapi.router.route_class = ValidationErrorLoggingRoute
+            app_fastapi.add_middleware(
+                TrustedOriginMiddleware,
+                allowed_origins=settings.allowed_origins,
+                port=settings.port
+            )
+
+            app_fastapi.mount("/tmp", StaticFiles(directory=TMP_DIR), name="static")
+
+            app_fastapi.mount(
+                "/model_dir",
+                StaticFiles(directory=settings.model_dir),
+                name="static",
+            )
+            app_fastapi.mount(
+                "/sound_dir",
+                StaticFiles(directory=settings.sound_dir),
+                name="static",
+            )
+
+            restVoiceChanger = MMVC_Rest_VoiceChanger(voiceChangerManager)
+            app_fastapi.include_router(restVoiceChanger.router)
+            
+            modelsApi = MMVC_Rest_Models(voiceChangerManager)
+            app_fastapi.include_router(modelsApi.router)
+
+            soundsApi = MMVC_Rest_Sounds(voiceChangerManager)
+            app_fastapi.include_router(soundsApi.router)
+
+            pretrainDownloader = MMVC_Rest_PretrainDownloader()
+            app_fastapi.include_router(pretrainDownloader.router)
+
+            cls._instance = app_fastapi
+            logger.info("Initialized.")
+            return cls._instance
+
+        return cls._instance
